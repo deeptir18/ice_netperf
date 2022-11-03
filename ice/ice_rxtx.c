@@ -12,10 +12,10 @@
 #include "ice_rxtx.h"
 
 #define ICE_TX_CKSUM_OFFLOAD_MASK (		 \
-		PKT_TX_IP_CKSUM |		 \
-		PKT_TX_L4_MASK |		 \
-		PKT_TX_TCP_SEG |		 \
-		PKT_TX_OUTER_IP_CKSUM)
+		RTE_MBUF_F_TX_IP_CKSUM |		 \
+		RTE_MBUF_F_TX_L4_MASK |		 \
+		RTE_MBUF_F_TX_TCP_SEG |		 \
+		RTE_MBUF_F_TX_OUTER_IP_CKSUM)
 
 #define ICE_RX_FLEX_ERR0_BITS	\
 	((1 << ICE_RX_FLEX_DESC_STATUS0_HBO_S) |	\
@@ -36,19 +36,19 @@ ice_rxd_error_to_pkt_flags(uint16_t stat_err0)
 		return 0;
 
 	if (likely(!(stat_err0 & ICE_RX_FLEX_ERR0_BITS))) {
-		flags |= (PKT_RX_IP_CKSUM_GOOD | PKT_RX_L4_CKSUM_GOOD);
+		flags |= (RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_GOOD);
 		return flags;
 	}
 
 	if (unlikely(stat_err0 & (1 << ICE_RX_FLEX_DESC_STATUS0_XSUM_IPE_S)))
-		flags |= PKT_RX_IP_CKSUM_BAD;
+		flags |= RTE_MBUF_F_RX_IP_CKSUM_BAD;
 	else
-		flags |= PKT_RX_IP_CKSUM_GOOD;
+		flags |= RTE_MBUF_F_RX_IP_CKSUM_GOOD;
 
 	if (unlikely(stat_err0 & (1 << ICE_RX_FLEX_DESC_STATUS0_XSUM_L4E_S)))
-		flags |= PKT_RX_L4_CKSUM_BAD;
+		flags |= RTE_MBUF_F_RX_L4_CKSUM_BAD;
 	else
-		flags |= PKT_RX_L4_CKSUM_GOOD;
+		flags |= RTE_MBUF_F_RX_L4_CKSUM_GOOD;
 
 	return flags;
 }
@@ -63,7 +63,7 @@ ice_rxd_to_pkt_fields(struct rte_mbuf *mb,
 
 	stat_err = rte_le_to_cpu_16(desc->status_error0);
 	if (likely(stat_err & (1 << ICE_RX_FLEX_DESC_STATUS0_RSS_VALID_S))) {
-		mb->ol_flags |= PKT_RX_RSS_HASH;
+		mb->ol_flags |= RTE_MBUF_F_RX_RSS_HASH;
 		mb->hash.rss = rte_le_to_cpu_32(desc->rss_hash);
 	}
 }
@@ -171,24 +171,24 @@ ice_txd_enable_checksum(uint64_t ol_flags,
 		<< ICE_TX_DESC_LEN_MACLEN_S;
 
 	/* Enable L3 checksum offloads */
-	if (ol_flags & PKT_TX_IP_CKSUM) {
+	if (ol_flags & RTE_MBUF_F_TX_IP_CKSUM) {
 		*td_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4_CSUM;
 		*td_offset |= (sizeof(struct rte_ipv4_hdr) >> 2) <<
 			      ICE_TX_DESC_LEN_IPLEN_S;
-	} else if (ol_flags & PKT_TX_IPV4) {
+	} else if (ol_flags & RTE_MBUF_F_TX_IPV4) {
 		*td_cmd |= ICE_TX_DESC_CMD_IIPT_IPV4;
 		*td_offset |= (sizeof(struct rte_ipv4_hdr) >> 2) <<
 			      ICE_TX_DESC_LEN_IPLEN_S;
 	}
 
 	/* Enable L4 checksum offloads */
-	switch (ol_flags & PKT_TX_L4_MASK) {
-	case PKT_TX_TCP_CKSUM:
+	switch (ol_flags & RTE_MBUF_F_TX_L4_MASK) {
+	case RTE_MBUF_F_TX_TCP_CKSUM:
 		*td_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_TCP;
 		*td_offset |= (sizeof(struct rte_tcp_hdr) >> 2) <<
 			      ICE_TX_DESC_LEN_L4_LEN_S;
 		break;
-	case PKT_TX_UDP_CKSUM:
+	case RTE_MBUF_F_TX_UDP_CKSUM:
 		*td_cmd |= ICE_TX_DESC_CMD_L4T_EOFT_UDP;
 		*td_offset |= (sizeof(struct rte_udp_hdr) >> 2) <<
 			      ICE_TX_DESC_LEN_L4_LEN_S;

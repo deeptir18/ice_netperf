@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <ethdev_driver.h>
 #include <rte_ether.h>
@@ -17,6 +18,18 @@
 #include "ice/ice_rxtx.h"
 
 #define BURST_SIZE 32
+#define MBUF_BUF_SIZE RTE_ETHER_MAX_JUMBO_FRAME_LEN + RTE_PKTMBUF_HEADROOM
+#define NUM_MBUFS 8000
+#define MBUF_CACHE_SIZE 250
+#define RX_RING_SIZE 2048
+#define TX_RING_SIZE 2048
+#define RX_PACKET_LEN 1024
+#define RX_PTHRESH 8
+#define RX_HTHRESH 8
+#define RX_WTHRESH 0
+#define TX_PTHRESH 0
+#define TX_HTHRESH 0
+#define TX_WTHRESH 0
 
 uint32_t kMagic = 0x6e626368; // 'nbch'
 
@@ -47,8 +60,11 @@ static uint32_t my_ip;
 static size_t payload_len;
 static unsigned int num_queues = 1;
 uint16_t next_port = 50000;
+struct rte_mempool *mbuf_pool;
 
-struct rte_eth_dev_data *data = (struct rte_eth_dev_data *) 0x1100bb0440;
+// struct rte_eth_dev_data *data = (struct rte_eth_dev_data *) 0x1100bb0440;
+// struct rte_eth_dev_data *data = (struct rte_eth_dev_data *) 0x01003b0440;
+struct rte_eth_dev_data *data;
 
 /* ice_netperf.c: simple implementation of netperf server for ice-compatible NICs */
 
@@ -136,6 +152,7 @@ static int do_server(void)
 			if (nb_rx == 0)
 				continue;
 
+			printf("Nb_rx: %d\n", nb_rx);
 			n_to_tx = 0;
 			for (i = 0; i < nb_rx; i++) {
 				buf = rx_bufs[i];
@@ -197,7 +214,7 @@ static int do_server(void)
 					/* enable computation of IPv4 checksum in hardware */
 					ptr_ipv4_hdr->hdr_checksum = 0;
 					/* lengths filled in by ice_rxtx.c */
-					buf->ol_flags = PKT_TX_IP_CKSUM | PKT_TX_IPV4;
+					buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
 				}
 
 				tx_bufs[n_to_tx++] = buf;
@@ -225,16 +242,15 @@ static int do_server(void)
 
 static int parse_netperf_args(int argc, char *argv[])
 {
-	long tmp;
-
-	/* argv[0] is still the program name */
+/*
 	if (argc < 3) {
 		printf("not enough arguments left: %d\n", argc);
 		return -EINVAL;
 	}
-
-	str_to_ip(argv[2], &my_ip);
-
+*/
+	str_to_ip("192.168.1.11", &my_ip);
+	mode = MODE_UDP_SERVER;
+/*
 	if (!strcmp(argv[1], "UDP_SERVER")) {
 		mode = MODE_UDP_SERVER;
 		argc -= 3;
@@ -246,7 +262,7 @@ static int parse_netperf_args(int argc, char *argv[])
 		printf("invalid mode '%s'\n", argv[1]);
 		return -EINVAL;
 	}
-
+*/
 	return 0;
 }
 
@@ -269,15 +285,16 @@ void map_page(int id, void *addr)
 	close(fd);
 }
 
-void map_device_memory(int id, void *addr, size_t size)
+void map_device_memory(int id, void *addr, size_t size, int additional_flags)
 {
 	char path[64];
 	int fd;
 	void *va;
 
-	snprintf(path, sizeof(path), "/sys/bus/pci/devices/0000:af:00.0/resource%d", id);
+	snprintf(path, sizeof(path), "/sys/bus/pci/devices/0000:81:00.1/resource%d", id);
 	fd = open(path, O_RDWR);
-	va = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	printf("fd: %d\n", fd);
+	va = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | additional_flags, fd, 0);
 	if (va == MAP_FAILED) {
 		printf("error, map failed\n");
 		perror("mmap");
@@ -285,6 +302,60 @@ void map_device_memory(int id, void *addr, size_t size)
 	printf("path: %s, va: %p, addr: %p\n", path, va, addr);
 	*(volatile int *)addr = *(volatile int *)addr;
 	close(fd);
+}
+
+int init_port(int port_id, struct rte_mempool *mbuf_pool) {
+	printf("Initializing port %u\n", (unsigned)(port_id));
+	const uint16_t rx_rings = 1;
+	const uint16_t tx_rings = 1;
+	const uint16_t nb_rxd = RX_RING_SIZE;
+	const uint16_t nb_txd = TX_RING_SIZE;
+	uint16_t mtu;
+    
+	struct rte_eth_dev_info dev_info = {};
+    	rte_eth_dev_info_get(port_id, &dev_info);
+    	rte_eth_dev_set_mtu(port_id, RX_PACKET_LEN);
+    	rte_eth_dev_get_mtu(port_id, &mtu);
+        printf("Dev info MTU:%u\n", mtu);
+   	struct rte_eth_conf port_conf = {};
+    	port_conf.rxmode.max_lro_pkt_size = RX_PACKET_LEN;
+            
+    	// port_conf.rxmode.offloads = DEV_RX_OFFLOAD_JUMBO_FRAME | RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+    	// port_conf.txmode.offloads = DEV_TX_OFFLOAD_MULTI_SEGS | DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_UDP_CKSUM;
+   	port_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+	port_conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
+
+    	struct rte_eth_rxconf rx_conf = {};
+    	rx_conf.rx_thresh.pthresh = RX_PTHRESH;
+    	rx_conf.rx_thresh.hthresh = RX_HTHRESH;
+    	rx_conf.rx_thresh.wthresh = RX_WTHRESH;
+    	rx_conf.rx_free_thresh = 32;
+
+    	struct rte_eth_txconf tx_conf = {};
+    	tx_conf.tx_thresh.pthresh = TX_PTHRESH;
+    	tx_conf.tx_thresh.hthresh = TX_HTHRESH;
+    	tx_conf.tx_thresh.wthresh = TX_WTHRESH;
+
+    	// configure the ethernet device.
+    	rte_eth_dev_configure(port_id, rx_rings, tx_rings, &port_conf);
+
+    	int socket_id = rte_eth_dev_socket_id(port_id);
+
+    	// allocate and set up 1 RX queue per Ethernet port.
+    	for (uint16_t i = 0; i < rx_rings; ++i) {
+		rte_eth_rx_queue_setup(port_id, i, nb_rxd, socket_id, &rx_conf, mbuf_pool);
+	}
+
+    	// allocate and set up 1 TX queue per Ethernet port.
+    	for (uint16_t i = 0; i < tx_rings; ++i) {
+       		rte_eth_tx_queue_setup(port_id, i, nb_txd, socket_id, &tx_conf);
+    	}
+
+    	// start the ethernet port.
+    	int dev_start_ret = rte_eth_dev_start(port_id);
+    	if (dev_start_ret != 0) {
+        	printf("Failed to start ethernet for prot %u\n", (unsigned)port_id);
+    	}
 }
 
 /*
@@ -296,7 +367,11 @@ main(int argc, char *argv[])
 	int i, args_parsed, res;
 	void *addr;
 
-	/* map DPDK memory, there are two chunks */
+	int status = rte_eal_init(argc, argv);
+	if (status < 0) {
+		printf("failed rte_eal_init: %d\n", status);
+	}
+/*	 map DPDK memory, there are two chunks
 	addr = (void *) 0x100200000;
 	for (i = 0; i < 64; i++) {
 		map_page(i, addr);
@@ -307,21 +382,46 @@ main(int argc, char *argv[])
 		map_page(i, addr);
 		addr += 0x200000;
 	}
-
+*/
 	/* map device memory, two chunks */
-	map_device_memory(0, (void *) 0x2101000000, 0x8000000);
-	map_device_memory(3, (void *) 0x2109000000, 0x10000);
+//	printf("Map device memory. Chunk 1. Id 0.\n");
+//	map_device_memory(0, (void *) 0x2101000000, 0x8000000);
+//	map_device_memory(0, (void *) 0x555555dc1f24, 0x8000000, -10880);
+//	printf("Map device memory. Chunk 2. Id 3.\n");
+//	map_device_memory(3, (void *) 0x2109000000, 0x10000);
+//	map_device_memory(3, (void *) 0x0, 0x10000, 0);
 
-	args_parsed = 4;
-
-	/* initialize our arguments */
+/*	args_parsed = 4;
 	argc -= args_parsed;
 	argv += args_parsed;
+*/
 	res = parse_netperf_args(argc, argv);
 	if (res < 0)
 		return 0;
 
-	rte_ether_addr_copy(&data->mac_addrs[0], &my_eth);
+	const uint16_t nbports = rte_eth_dev_count_avail();
+	printf("Number of ports available: %d\n", nbports);
+	if (nbports <= 0) {
+		printf("No ports available\n");
+		return -1;	
+	}
+
+	// get port id
+	printf("is port 0 valid: %d\n", rte_eth_dev_is_valid_port(0));
+
+	// PROGRESS: confirmed that port 0 is the port we are looking for. There is only 1 port available.
+	
+	// 8000 is number of mbufs in the pool. These mbufs are ref counted and 
+	// added to the pool again once they are done being used for rx/tx a packet.
+	// 250 is the mbuf_cache_size. 250 in testpmd and dpdk-netperf
+	mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
+	printf("socket id from rte_socket_id: %d\n", rte_socket_id());
+	printf("socket id from rte_eth_dev_socket_id: %d\n", rte_eth_dev_socket_id(0));	
+	
+	init_port(0, mbuf_pool);
+	
+	data = &rte_eth_devices[0];
+	rte_ether_addr_copy(&data->mac_addrs[0], &my_eth); // same as rte_eth_macaddr_get()
 	printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
 			   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
 			(unsigned) dpdk_port,

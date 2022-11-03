@@ -3,8 +3,8 @@ CONFIG_DEBUG=y
 CC = gcc
 FLAGS = -g
 
-DPDK_PATH = /data/users/deeptir/dpdk
-INC = -I$(DPDK_PATH)/build/include -I$(DPDK_PATH)/lib/ethdev
+DPDK_PATH = /data/users/sravi2/dpdk
+INC = -I$(DPDK_PATH)/build/include -I$(DPDK_PATH)/lib/ethdev -I$(DPDK_PATH)/lib/eal/include
 FLAGS += $(INC) -mssse3
 
 ifeq ($(CONFIG_DEBUG),y)
@@ -19,6 +19,8 @@ DPDK_LIBS += -lrte_mempool
 DPDK_LIBS += -lrte_ring
 DPDK_LIBS += -lrte_eal
 DPDK_LIBS += -lrte_kvargs
+DPDK_LIBS += -lrte_ethdev
+DPDK_LIBS += -lrte_mbuf
 
 net_src = $(wildcard ice/*.c)
 net_obj = $(net_src:.c=.o)
