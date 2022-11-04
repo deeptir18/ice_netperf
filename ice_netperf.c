@@ -19,7 +19,10 @@
 
 #define BURST_SIZE 32
 #define MBUF_BUF_SIZE RTE_ETHER_MAX_JUMBO_FRAME_LEN + RTE_PKTMBUF_HEADROOM
+// 8000 is number of mbufs in the pool. These mbufs are ref counted and 
+// added to the pool again once they are done being used for rx/tx a packet.
 #define NUM_MBUFS 8000
+// 250 is the mbuf_cache_size in testpmd and dpdk-netperf
 #define MBUF_CACHE_SIZE 250
 #define RX_RING_SIZE 2048
 #define TX_RING_SIZE 2048
@@ -62,8 +65,6 @@ static unsigned int num_queues = 1;
 uint16_t next_port = 50000;
 struct rte_mempool *mbuf_pool;
 
-// struct rte_eth_dev_data *data = (struct rte_eth_dev_data *) 0x1100bb0440;
-// struct rte_eth_dev_data *data = (struct rte_eth_dev_data *) 0x01003b0440;
 struct rte_eth_dev_data *data;
 
 /* ice_netperf.c: simple implementation of netperf server for ice-compatible NICs */
@@ -240,32 +241,6 @@ static int do_server(void)
 	return 0;
 }
 
-static int parse_netperf_args(int argc, char *argv[])
-{
-/*
-	if (argc < 3) {
-		printf("not enough arguments left: %d\n", argc);
-		return -EINVAL;
-	}
-*/
-	str_to_ip("192.168.1.11", &my_ip);
-	mode = MODE_UDP_SERVER;
-/*
-	if (!strcmp(argv[1], "UDP_SERVER")) {
-		mode = MODE_UDP_SERVER;
-		argc -= 3;
-		if (argc >= 1) {
-			if (sscanf(argv[3], "%u", &num_queues) != 1)
-				return -EINVAL;
-		}
-	} else {
-		printf("invalid mode '%s'\n", argv[1]);
-		return -EINVAL;
-	}
-*/
-	return 0;
-}
-
 void map_page(int id, void *addr)
 {
 	char path[64];
@@ -320,8 +295,6 @@ int init_port(int port_id, struct rte_mempool *mbuf_pool) {
    	struct rte_eth_conf port_conf = {};
     	port_conf.rxmode.max_lro_pkt_size = RX_PACKET_LEN;
             
-    	// port_conf.rxmode.offloads = DEV_RX_OFFLOAD_JUMBO_FRAME | RTE_ETH_RX_OFFLOAD_TIMESTAMP;
-    	// port_conf.txmode.offloads = DEV_TX_OFFLOAD_MULTI_SEGS | DEV_TX_OFFLOAD_IPV4_CKSUM | DEV_TX_OFFLOAD_UDP_CKSUM;
    	port_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
 	port_conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
 
@@ -354,8 +327,48 @@ int init_port(int port_id, struct rte_mempool *mbuf_pool) {
     	// start the ethernet port.
     	int dev_start_ret = rte_eth_dev_start(port_id);
     	if (dev_start_ret != 0) {
-        	printf("Failed to start ethernet for prot %u\n", (unsigned)port_id);
+        	printf("Failed to start ethernet for port %u\n", (unsigned)port_id);
     	}
+}
+
+static int init_dpdk(int argc, char *argv[])
+{
+        dpdk_port = 0;
+
+        int status = rte_eal_init(argc, argv);
+        if (status < 0) {
+                printf("failed rte_eal_init: %d\n", status);
+        }
+
+        str_to_ip("192.168.1.11", &my_ip);
+        mode = MODE_UDP_SERVER;
+
+        const uint16_t nbports = rte_eth_dev_count_avail();
+        printf("Number of ports available: %d\n", nbports);
+        if (nbports <= 0) {
+                printf("No ports available\n");
+                return -1;
+        }
+
+        if (!rte_eth_dev_is_valid_port(dpdk_port)) {
+                printf("port %u is not valid\n", dpdk_port);
+        }
+
+        printf("socket id from rte_socket_id: %d\n", rte_socket_id());
+        mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
+
+        /* port initialization. set up rx/tx queues */
+        init_port(dpdk_port, mbuf_pool);
+
+        data = rte_eth_devices[0].data;
+        rte_ether_addr_copy(&data->mac_addrs[0], &my_eth); // same as rte_eth_macaddr_get()
+        printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+                           " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+                        (unsigned) dpdk_port,
+                        my_eth.addr_bytes[0], my_eth.addr_bytes[1],
+                        my_eth.addr_bytes[2], my_eth.addr_bytes[3],
+                        my_eth.addr_bytes[4], my_eth.addr_bytes[5]);
+        return 0;
 }
 
 /*
@@ -364,70 +377,7 @@ int init_port(int port_id, struct rte_mempool *mbuf_pool) {
 int
 main(int argc, char *argv[])
 {
-	int i, args_parsed, res;
-	void *addr;
-
-	int status = rte_eal_init(argc, argv);
-	if (status < 0) {
-		printf("failed rte_eal_init: %d\n", status);
-	}
-/*	 map DPDK memory, there are two chunks
-	addr = (void *) 0x100200000;
-	for (i = 0; i < 64; i++) {
-		map_page(i, addr);
-		addr += 0x200000;
-	}
-	addr = (void *) 0x1100a00000;
-	for (i = 32768; i < 32793; i++) {
-		map_page(i, addr);
-		addr += 0x200000;
-	}
-*/
-	/* map device memory, two chunks */
-//	printf("Map device memory. Chunk 1. Id 0.\n");
-//	map_device_memory(0, (void *) 0x2101000000, 0x8000000);
-//	map_device_memory(0, (void *) 0x555555dc1f24, 0x8000000, -10880);
-//	printf("Map device memory. Chunk 2. Id 3.\n");
-//	map_device_memory(3, (void *) 0x2109000000, 0x10000);
-//	map_device_memory(3, (void *) 0x0, 0x10000, 0);
-
-/*	args_parsed = 4;
-	argc -= args_parsed;
-	argv += args_parsed;
-*/
-	res = parse_netperf_args(argc, argv);
-	if (res < 0)
-		return 0;
-
-	const uint16_t nbports = rte_eth_dev_count_avail();
-	printf("Number of ports available: %d\n", nbports);
-	if (nbports <= 0) {
-		printf("No ports available\n");
-		return -1;	
-	}
-
-	// get port id
-	printf("is port 0 valid: %d\n", rte_eth_dev_is_valid_port(0));
-
-	// PROGRESS: confirmed that port 0 is the port we are looking for. There is only 1 port available.
-	
-	// 8000 is number of mbufs in the pool. These mbufs are ref counted and 
-	// added to the pool again once they are done being used for rx/tx a packet.
-	// 250 is the mbuf_cache_size. 250 in testpmd and dpdk-netperf
-	mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
-	printf("socket id from rte_socket_id: %d\n", rte_socket_id());
-	printf("socket id from rte_eth_dev_socket_id: %d\n", rte_eth_dev_socket_id(0));	
-	
-	init_port(0, mbuf_pool);
-	
-	data = &rte_eth_devices[0];
-	rte_ether_addr_copy(&data->mac_addrs[0], &my_eth); // same as rte_eth_macaddr_get()
-	printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
-			   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
-			(unsigned) dpdk_port,
-			my_eth.addr_bytes[0], my_eth.addr_bytes[1],
-			my_eth.addr_bytes[2], my_eth.addr_bytes[3],
-			my_eth.addr_bytes[4], my_eth.addr_bytes[5]);
+	init_dpdk(argc, argv);
 
 	if (mode == MODE_UDP_CLIENT)
 		printf("ERROR, only server mode is supported\n");
