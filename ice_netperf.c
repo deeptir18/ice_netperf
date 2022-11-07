@@ -33,6 +33,9 @@
 #define TX_PTHRESH 0
 #define TX_HTHRESH 0
 #define TX_WTHRESH 0
+#define IPV4_HDR_OFFSET RTE_ETHER_HDR_LEN
+#define UDP_HDR_OFFSET (RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
+
 
 uint32_t kMagic = 0x6e626368; // 'nbch'
 
@@ -63,7 +66,8 @@ static uint32_t my_ip;
 static size_t payload_len;
 static unsigned int num_queues = 1;
 uint16_t next_port = 50000;
-struct rte_mempool *mbuf_pool;
+struct rte_mempool *rx_mbuf_pool;
+struct rte_mempool *tx_mbuf_pool;
 
 struct rte_eth_dev_data *data;
 
@@ -128,14 +132,13 @@ static int do_server(void)
 	struct rte_mbuf *rx_bufs[BURST_SIZE];
 	struct rte_mbuf *tx_bufs[BURST_SIZE];
 	struct rte_mbuf *buf;
+	struct rte_mbuf *tx_mbuf;
 	uint16_t nb_rx, n_to_tx, nb_tx, i, j, q;
 	struct ice_rx_queue *rxq;
 	struct ice_tx_queue *txq;
-	struct rte_ether_hdr *ptr_mac_hdr;
-	struct rte_ether_addr src_addr;
-	struct rte_ipv4_hdr *ptr_ipv4_hdr;
-	uint32_t src_ip_addr;
-	uint16_t tmp_port;
+	struct rte_ether_hdr *ptr_rx_mac_hdr, *ptr_tx_mac_hdr;
+	struct rte_ipv4_hdr *ptr_rx_ipv4_hdr, *ptr_tx_ipv4_hdr;
+	struct rte_udp_hdr *ptr_rx_udp_hdr, *ptr_tx_udp_hdr;
 	struct nbench_req *control_req;
 	struct nbench_resp *control_resp;
 
@@ -165,60 +168,71 @@ static int do_server(void)
 				if (!check_ip_hdr(buf))
 					goto free_buf;
 
+				/* allocate buf in tx mempool and copy rx_buf into it */
+				tx_mbuf = rte_pktmbuf_copy(buf, tx_mbuf_pool, 0, UINT32_MAX);
+				if (tx_mbuf == NULL) {
+					printf("deep copy of rx_mbuf failed\n");
+					return -1;
+				}
+
 				/* swap src and dst ether addresses */
-				ptr_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
-				rte_ether_addr_copy(&ptr_mac_hdr->src_addr, &src_addr);
-				rte_ether_addr_copy(&ptr_mac_hdr->dst_addr, &ptr_mac_hdr->src_addr);
-				rte_ether_addr_copy(&src_addr, &ptr_mac_hdr->dst_addr);
+				ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
+				ptr_tx_mac_hdr = rte_pktmbuf_mtod(tx_mbuf, struct rte_ether_hdr *);
+				rte_ether_addr_copy(&ptr_rx_mac_hdr->src_addr, &ptr_tx_mac_hdr->dst_addr);
+				rte_ether_addr_copy(&ptr_rx_mac_hdr->dst_addr, &ptr_tx_mac_hdr->src_addr);
 
 				/* swap src and dst IP addresses */
-				ptr_ipv4_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_ipv4_hdr *,
-								RTE_ETHER_HDR_LEN);
-				src_ip_addr = ptr_ipv4_hdr->src_addr;
-				ptr_ipv4_hdr->src_addr = ptr_ipv4_hdr->dst_addr;
-				ptr_ipv4_hdr->dst_addr = src_ip_addr;
+				ptr_rx_ipv4_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_ipv4_hdr *,
+								IPV4_HDR_OFFSET);
+				ptr_tx_ipv4_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_ipv4_hdr *,
+					       			IPV4_HDR_OFFSET);
+				ptr_tx_ipv4_hdr->src_addr = ptr_rx_ipv4_hdr->dst_addr;
+				ptr_tx_ipv4_hdr->dst_addr = ptr_rx_ipv4_hdr->src_addr;
 
 				/* swap UDP ports */
-				struct rte_udp_hdr *rte_udp_hdr;
-				rte_udp_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_udp_hdr *,
-								RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr));
-				tmp_port = rte_udp_hdr->src_port;
-				rte_udp_hdr->src_port = rte_udp_hdr->dst_port;
-				rte_udp_hdr->dst_port = tmp_port;
+				ptr_rx_udp_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_udp_hdr *,
+								UDP_HDR_OFFSET);
+				ptr_tx_udp_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_udp_hdr *,
+								UDP_HDR_OFFSET);
+				ptr_tx_udp_hdr->src_port = ptr_rx_udp_hdr->dst_port;
+				ptr_tx_udp_hdr->dst_port = ptr_rx_udp_hdr->src_port;
+
 
 				/* check if this is a control message and we need to reply with
 				 * ports */
-				control_req = rte_pktmbuf_mtod_offset(buf, struct nbench_req *,
-								RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr) +
-								sizeof(struct rte_udp_hdr));
-				if (control_req->magic == kMagic) {
-					rte_pktmbuf_append(buf, sizeof(struct nbench_resp) +
-							sizeof(uint16_t) *
-							control_req->nports -
-							sizeof(struct nbench_req));
-					control_resp = (struct nbench_resp *) control_req;
+//				control_req = rte_pktmbuf_mtod_offset(buf, struct nbench_req *,
+//								RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr) +
+//								sizeof(struct rte_udp_hdr));
+//				if (control_req->magic == kMagic) {
+//					rte_pktmbuf_append(buf, sizeof(struct nbench_resp) +
+//							sizeof(uint16_t) *
+//							control_req->nports -
+//							sizeof(struct nbench_req));
+//					control_resp = (struct nbench_resp *) control_req;
+//
+//					/* add ports to response */
+//					for (j = 0; j < control_req->nports; j++) {
+//						/* simple port allocation */
+//						control_resp->ports[j] = rte_cpu_to_be_16(next_port++);
+//					}
+//
+//					/* adjust lengths in UDP and IPv4 headers */
+//					payload_len = sizeof(struct nbench_resp) +
+//						sizeof(uint16_t) * control_req->nports;
+//					rte_udp_hdr->dgram_len = rte_cpu_to_be_16(sizeof(struct rte_udp_hdr) +
+//									payload_len);
+//					ptr_ipv4_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
+//										sizeof(struct rte_udp_hdr) + payload_len);
+//
+//					/* enable computation of IPv4 checksum in hardware */
+//					ptr_ipv4_hdr->hdr_checksum = 0;
+//					/* lengths filled in by ice_rxtx.c */
+//					buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
+//				}
 
-					/* add ports to response */
-					for (j = 0; j < control_req->nports; j++) {
-						/* simple port allocation */
-						control_resp->ports[j] = rte_cpu_to_be_16(next_port++);
-					}
-
-					/* adjust lengths in UDP and IPv4 headers */
-					payload_len = sizeof(struct nbench_resp) +
-						sizeof(uint16_t) * control_req->nports;
-					rte_udp_hdr->dgram_len = rte_cpu_to_be_16(sizeof(struct rte_udp_hdr) +
-									payload_len);
-					ptr_ipv4_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
-										sizeof(struct rte_udp_hdr) + payload_len);
-
-					/* enable computation of IPv4 checksum in hardware */
-					ptr_ipv4_hdr->hdr_checksum = 0;
-					/* lengths filled in by ice_rxtx.c */
-					buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
-				}
-
-				tx_bufs[n_to_tx++] = buf;
+				printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
+				printf("rx_mbuf data ptr: %p\n", buf->buf_addr);				
+				tx_bufs[n_to_tx++] = tx_mbuf;
 				continue;
 
 			free_buf:
@@ -229,8 +243,10 @@ static int do_server(void)
 			/* transmit packets */
 			nb_tx = 0;
 			txq = data->tx_queues[q];
-			for (j = 0; j < n_to_tx; j++)
+			for (j = 0; j < n_to_tx; j++) {
 				nb_tx += ice_xmit_pkt(txq, tx_bufs[j]);
+				rte_pktmbuf_free(tx_bufs[j]);
+			}
 
 			if (nb_tx != n_to_tx)
 				printf("error: could not transmit all packets: %d %d\n",
@@ -355,10 +371,12 @@ static int init_dpdk(int argc, char *argv[])
         }
 
         printf("socket id from rte_socket_id: %d\n", rte_socket_id());
-        mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
+        rx_mbuf_pool = rte_pktmbuf_pool_create("rx_mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
+        tx_mbuf_pool = rte_pktmbuf_pool_create("tx_mbuf_pool", NUM_MBUFS, MBUF_CACHE_SIZE, 0, MBUF_BUF_SIZE, rte_socket_id());
+	
+	/* port initialization. set up rx/tx queues */
+        init_port(dpdk_port, rx_mbuf_pool);
 
-        /* port initialization. set up rx/tx queues */
-        init_port(dpdk_port, mbuf_pool);
 
         data = rte_eth_devices[0].data;
         rte_ether_addr_copy(&data->mac_addrs[0], &my_eth); // same as rte_eth_macaddr_get()
