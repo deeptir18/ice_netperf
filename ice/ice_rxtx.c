@@ -8,6 +8,7 @@
 #include <rte_ip.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
+//#include <ice_ethdev.h>
 
 #include "ice_rxtx.h"
 
@@ -24,6 +25,12 @@
 	 (1 << ICE_RX_FLEX_DESC_STATUS0_XSUM_EIPE_S) |	\
 	 (1 << ICE_RX_FLEX_DESC_STATUS0_XSUM_EUDPE_S) |	\
 	 (1 << ICE_RX_FLEX_DESC_STATUS0_RXE_S))
+
+/* ICE_VSI_TO */
+#define ICE_VSI_TO_HW(vsi) \
+	(&(((struct ice_vsi *)vsi)->adapter->hw))
+#define ICE_VSI_TO_PF(vsi) \
+	(&(((struct ice_vsi *)vsi)->adapter->pf))
 
 /* Rx L3/L4 checksum */
 static inline uint64_t
@@ -68,6 +75,15 @@ ice_rxd_to_pkt_fields(struct rte_mbuf *mb,
 	}
 }
 
+
+static inline void
+ice_init(void *rx_queue) {
+	struct ice_rx_queue *rxq = rx_queue;
+	struct ice_vsi *vsi = rxq->vsi;
+	struct ice_hw *hw = ICE_VSI_TO_HW(vsi);
+	struct ice_pf *pf = ICE_VSI_TO_PF(vsi);
+	rxq->qrx_tail = hw->hw_addr + QRX_TAIL(rxq->reg_idx);
+}
 uint16_t
 ice_recv_pkts(void *rx_queue,
 	      struct rte_mbuf **rx_pkts,
@@ -149,11 +165,17 @@ ice_recv_pkts(void *rx_queue,
 	 */
 	nb_hold = (uint16_t)(nb_hold + rxq->nb_rx_hold);
 	if (nb_hold > rxq->rx_free_thresh) {
+		printf("wrap around\n");
+		printf("nb_rx_hold %u\trx_free_thresh: %u\t", rxq->nb_rx_hold, rxq->rx_free_thresh);
+		printf("nb_rx_desc: %u\tnb_hold: %u\n", rxq->nb_rx_desc, nb_hold);
 		rx_id = (uint16_t)(rx_id == 0 ?
 				   (rxq->nb_rx_desc - 1) : (rx_id - 1));
 		/* write TAIL register */
 		ICE_PCI_REG_WRITE(rxq->qrx_tail, rx_id);
 		nb_hold = 0;
+	} else {
+		//printf("nb_rx_hold %u\trx_free_thresh: %u\t", rxq->nb_rx_hold, rxq->rx_free_thresh);
+		//printf("nb_rx_desc: %u\tnb_hold: %u\n", rxq->nb_rx_desc, nb_hold);
 	}
 	rxq->nb_rx_hold = nb_hold;
 

@@ -17,7 +17,7 @@
 
 #include "ice/ice_rxtx.h"
 
-#define BURST_SIZE 32
+#define BURST_SIZE 4000
 #define MBUF_BUF_SIZE RTE_ETHER_MAX_JUMBO_FRAME_LEN + RTE_PKTMBUF_HEADROOM
 // 8000 is number of mbufs in the pool. These mbufs are ref counted and 
 // added to the pool again once they are done being used for rx/tx a packet.
@@ -233,6 +233,7 @@ static int do_server(void)
 				printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
 				printf("rx_mbuf data ptr: %p\n", buf->buf_addr);				
 				tx_bufs[n_to_tx++] = tx_mbuf;
+				rte_pktmbuf_free(buf);
 				continue;
 
 			free_buf:
@@ -246,6 +247,7 @@ static int do_server(void)
 			for (j = 0; j < n_to_tx; j++) {
 				nb_tx += ice_xmit_pkt(txq, tx_bufs[j]);
 				rte_pktmbuf_free(tx_bufs[j]);
+				rte_pktmbuf_free(rx_bufs[j]);
 			}
 
 			if (nb_tx != n_to_tx)
