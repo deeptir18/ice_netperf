@@ -161,5 +161,5 @@ enum ice_tx_desc_len_fields {
 };
 
 #define ICE_TXD_QW1_TX_BUF_SZ_S	34
-
+#define ICE_TXD_QW1_TX_BUF_SZ_M	(0x3FFFULL << ICE_TXD_QW1_TX_BUF_SZ_S)
 #define ICE_TXD_QW1_L2TAG1_S	48

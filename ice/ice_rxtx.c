@@ -3,7 +3,7 @@
  */
 
 #include <stdio.h>
-
+#include <ethdev_driver.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_tcp.h>
@@ -31,6 +31,12 @@
 	(&(((struct ice_vsi *)vsi)->adapter->hw))
 #define ICE_VSI_TO_PF(vsi) \
 	(&(((struct ice_vsi *)vsi)->adapter->pf))
+
+/* HW requires that TX buffer size ranges from 1B up to (16K-1)B. */
+#define ICE_MAX_DATA_PER_TXD \
+	(ICE_TXD_QW1_TX_BUF_SZ_M >> ICE_TXD_QW1_TX_BUF_SZ_S)
+
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 
 /* Rx L3/L4 checksum */
 static inline uint64_t
@@ -75,7 +81,7 @@ ice_rxd_to_pkt_fields(struct rte_mbuf *mb,
 	}
 }
 
-
+/*
 static inline void
 ice_init(void *rx_queue) {
 	struct ice_rx_queue *rxq = rx_queue;
@@ -84,6 +90,101 @@ ice_init(void *rx_queue) {
 	struct ice_pf *pf = ICE_VSI_TO_PF(vsi);
 	rxq->qrx_tail = hw->hw_addr + QRX_TAIL(rxq->reg_idx);
 }
+*/
+
+
+/* Allocate mbufs for all descriptors in rx queue */
+/*
+static int
+ice_alloc_rx_queue_mbufs(struct ice_rx_queue *rxq)
+{
+	struct ice_rx_entry *rxe = rxq->sw_ring;
+	uint64_t dma_addr;
+	uint16_t i;
+
+	for (i = 0; i < rxq->nb_rx_desc; i++) {
+		volatile union ice_rx_flex_desc *rxd;
+		struct rte_mbuf *mbuf = rte_mbuf_raw_alloc(rxq->mp);
+
+		if (unlikely(!mbuf)) {
+			printf("Failed to allocate mbuf for RX");
+			return -ENOMEM;
+		}
+
+		rte_mbuf_refcnt_set(mbuf, 1);
+		mbuf->next = NULL;
+		mbuf->data_off = RTE_PKTMBUF_HEADROOM;
+		mbuf->nb_segs = 1;
+		mbuf->port = rxq->port_id;
+
+		dma_addr =
+			rte_cpu_to_le_64(rte_mbuf_data_iova_default(mbuf));
+
+		rxd = &rxq->rx_ring[i];
+		rxd->read.pkt_addr = dma_addr;
+		rxd->read.hdr_addr = 0;
+#ifndef RTE_LIBRTE_ICE_16BYTE_RX_DESC
+		rxd->read.rsvd1 = 0;
+		rxd->read.rsvd2 = 0;
+#endif
+		rxe[i].mbuf = mbuf;
+	}
+
+	return 0;
+}
+
+int
+ice_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id)
+{
+	struct ice_rx_queue *rxq;
+	int err;
+	struct ice_hw *hw = (&((struct ice_adapter *)dev->data->dev_private)->hw);
+
+	if (rx_queue_id >= dev->data->nb_rx_queues) {
+		printf("RX queue %u is out of range %u",
+			    rx_queue_id, dev->data->nb_rx_queues);
+		return -EINVAL;
+	}
+
+	rxq = dev->data->rx_queues[rx_queue_id];
+	if (!rxq || !rxq->q_set) {
+		printf("RX queue %u not available or setup",
+			    rx_queue_id);
+		return -EINVAL;
+	}
+
+	err = ice_program_hw_rx_queue(rxq);
+	if (err) {
+		printf("fail to program RX queue %u",
+			    rx_queue_id);
+		return -EIO;
+	}
+
+	err = ice_alloc_rx_queue_mbufs(rxq);
+	if (err) {
+		printf("Failed to allocate RX queue mbuf");
+		return -ENOMEM;
+	}
+
+	ICE_PCI_REG_WRITE(rxq->qrx_tail, rxq->nb_rx_desc - 1);
+
+	err = ice_switch_rx_queue(hw, rxq->reg_idx, true);
+	if (err) {
+		printf("Failed to switch RX queue %u on",
+			    rx_queue_id);
+
+		rxq->rx_rel_mbufs(rxq);
+		//ice_reset_rx_queue(rxq);
+		return -EINVAL;
+	}
+
+	dev->data->rx_queue_state[rx_queue_id] =
+		RTE_ETH_QUEUE_STATE_STARTED;
+
+	return 0;
+}
+*/
+
 uint16_t
 ice_recv_pkts(void *rx_queue,
 	      struct rte_mbuf **rx_pkts,
@@ -268,6 +369,222 @@ ice_xmit_cleanup(struct ice_tx_queue *txq)
 	txq->nb_tx_free = (uint16_t)(txq->nb_tx_free + nb_tx_to_clean);
 
 	return 0;
+}
+
+/* Calculate the number of TX descriptors needed for each pkt */
+static inline uint16_t
+ice_calc_pkt_desc(struct rte_mbuf *tx_pkt)
+{
+	struct rte_mbuf *txd = tx_pkt;
+	uint16_t count = 0;
+
+	while (txd != NULL) {
+		count += DIV_ROUND_UP(txd->data_len, ICE_MAX_DATA_PER_TXD);
+		txd = txd->next;
+	}
+
+	return count;
+}
+
+uint16_t
+ice_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+{
+	struct ice_tx_queue *txq;
+	volatile struct ice_tx_desc *tx_ring;
+	volatile struct ice_tx_desc *txd;
+	struct ice_tx_entry *sw_ring;
+	struct ice_tx_entry *txe, *txn;
+	struct rte_mbuf *tx_pkt;
+	struct rte_mbuf *m_seg;
+	uint16_t tx_id;
+	uint16_t nb_tx;
+	uint16_t nb_used;
+	uint32_t td_cmd = 0;
+	uint32_t td_offset = 0;
+	uint32_t td_tag = 0;
+	uint16_t tx_last;
+	uint16_t slen;
+	uint64_t buf_dma_addr;
+	uint64_t ol_flags;
+
+	txq = tx_queue;
+	sw_ring = txq->sw_ring;
+	tx_ring = txq->tx_ring;
+	tx_id = txq->tx_tail;
+	txe = &sw_ring[tx_id];
+
+	/* Check if the descriptor ring needs to be cleaned. */
+	if (txq->nb_tx_free < txq->tx_free_thresh)
+		(void)ice_xmit_cleanup(txq);
+
+	for (nb_tx = 0; nb_tx < nb_pkts; nb_tx++) {
+		tx_pkt = *tx_pkts++;
+
+		td_cmd = 0;
+		td_tag = 0;
+		td_offset = 0;
+		ol_flags = tx_pkt->ol_flags;
+
+		/* The number of descriptors that must be allocated for
+		 * a packet equals to the number of the segments of that
+		 * packet plus the number of context descriptor if needed.
+		 * Recalculate the needed tx descs when TSO enabled in case
+		 * the mbuf data size exceeds max data size that hw allows
+		 * per tx desc.
+		 */
+		if (ol_flags & RTE_MBUF_F_TX_TCP_SEG)
+			nb_used = (uint16_t)(ice_calc_pkt_desc(tx_pkt));
+		else
+			nb_used = (uint16_t)(tx_pkt->nb_segs);
+		tx_last = (uint16_t)(tx_id + nb_used - 1);
+
+		//printf("DEBUG INFO ice_xmit_pkts\n");
+		//printf("number of segs: %u\n", tx_pkt->nb_segs);
+		//printf("nb_used: %u\n", nb_used);
+		//printf("tx_id: %u\ttx_last: %u", tx_id, tx_last);
+		/* Circular ring */
+		if (tx_last >= txq->nb_tx_desc)
+			tx_last = (uint16_t)(tx_last - txq->nb_tx_desc);
+
+		if (nb_used > txq->nb_tx_free) {
+			if (ice_xmit_cleanup(txq) != 0) {
+				if (nb_tx == 0)
+					return 0;
+				goto end_of_tx;
+			}
+			if (unlikely(nb_used > txq->tx_rs_thresh)) {
+				while (nb_used > txq->nb_tx_free) {
+					if (ice_xmit_cleanup(txq) != 0) {
+						if (nb_tx == 0)
+							return 0;
+						goto end_of_tx;
+					}
+				}
+			}
+		}
+
+		/* Descriptor based VLAN insertion */
+		if (ol_flags & (RTE_MBUF_F_TX_VLAN | RTE_MBUF_F_TX_QINQ)) {
+			td_cmd |= ICE_TX_DESC_CMD_IL2TAG1;
+			td_tag = tx_pkt->vlan_tci;
+		}
+
+		/* Enable checksum offloading */
+		if (ol_flags & ICE_TX_CKSUM_OFFLOAD_MASK)
+			ice_txd_enable_checksum(ol_flags, &td_cmd, &td_offset);
+
+//		if (nb_ctx) {
+//			/* Setup TX context descriptor if required */
+//			volatile struct ice_tx_ctx_desc *ctx_txd =
+//				(volatile struct ice_tx_ctx_desc *)
+//					&tx_ring[tx_id];
+//			uint16_t cd_l2tag2 = 0;
+//			uint64_t cd_type_cmd_tso_mss = ICE_TX_DESC_DTYPE_CTX;
+//
+//			txn = &sw_ring[txe->next_id];
+//			RTE_MBUF_PREFETCH_TO_FREE(txn->mbuf);
+//			if (txe->mbuf) {
+//				rte_pktmbuf_free_seg(txe->mbuf);
+//				txe->mbuf = NULL;
+//			}
+//
+//			if (ol_flags & RTE_MBUF_F_TX_TCP_SEG)
+//				cd_type_cmd_tso_mss |=
+//					ice_set_tso_ctx(tx_pkt, tx_offload);
+//			else if (ol_flags & RTE_MBUF_F_TX_IEEE1588_TMST)
+//				cd_type_cmd_tso_mss |=
+//					((uint64_t)ICE_TX_CTX_DESC_TSYN <<
+//					ICE_TXD_CTX_QW1_CMD_S);
+//
+//			/* TX context descriptor based double VLAN insert */
+//			if (ol_flags & RTE_MBUF_F_TX_QINQ) {
+//				cd_l2tag2 = tx_pkt->vlan_tci_outer;
+//				cd_type_cmd_tso_mss |=
+//					((uint64_t)ICE_TX_CTX_DESC_IL2TAG2 <<
+//					 ICE_TXD_CTX_QW1_CMD_S);
+//			}
+//			ctx_txd->l2tag2 = rte_cpu_to_le_16(cd_l2tag2);
+//			ctx_txd->qw1 =
+//				rte_cpu_to_le_64(cd_type_cmd_tso_mss);
+//
+//			txe->last_id = tx_last;
+//			tx_id = txe->next_id;
+//			txe = txn;
+//		}
+		m_seg = tx_pkt;
+
+		do {
+			txd = &tx_ring[tx_id];
+			txn = &sw_ring[txe->next_id];
+
+			if (txe->mbuf)
+				rte_pktmbuf_free_seg(txe->mbuf);
+			txe->mbuf = m_seg;
+
+			/* Setup TX Descriptor */
+			slen = m_seg->data_len;
+			buf_dma_addr = rte_mbuf_data_iova(m_seg);
+
+			while ((ol_flags & RTE_MBUF_F_TX_TCP_SEG) &&
+				unlikely(slen > ICE_MAX_DATA_PER_TXD)) {
+				txd->buf_addr = rte_cpu_to_le_64(buf_dma_addr);
+				txd->cmd_type_offset_bsz =
+				rte_cpu_to_le_64(ICE_TX_DESC_DTYPE_DATA |
+				((uint64_t)td_cmd << ICE_TXD_QW1_CMD_S) |
+				((uint64_t)td_offset << ICE_TXD_QW1_OFFSET_S) |
+				((uint64_t)ICE_MAX_DATA_PER_TXD <<
+				 ICE_TXD_QW1_TX_BUF_SZ_S) |
+				((uint64_t)td_tag << ICE_TXD_QW1_L2TAG1_S));
+
+				buf_dma_addr += ICE_MAX_DATA_PER_TXD;
+				slen -= ICE_MAX_DATA_PER_TXD;
+
+				txe->last_id = tx_last;
+				tx_id = txe->next_id;
+				txe = txn;
+				txd = &tx_ring[tx_id];
+				txn = &sw_ring[txe->next_id];
+			}
+
+			txd->buf_addr = rte_cpu_to_le_64(buf_dma_addr);
+			txd->cmd_type_offset_bsz =
+				rte_cpu_to_le_64(ICE_TX_DESC_DTYPE_DATA |
+				((uint64_t)td_cmd << ICE_TXD_QW1_CMD_S) |
+				((uint64_t)td_offset << ICE_TXD_QW1_OFFSET_S) |
+				((uint64_t)slen << ICE_TXD_QW1_TX_BUF_SZ_S) |
+				((uint64_t)td_tag << ICE_TXD_QW1_L2TAG1_S));
+
+			txe->last_id = tx_last;
+			tx_id = txe->next_id;
+			txe = txn;
+			m_seg = m_seg->next;
+		} while (m_seg);
+
+		/* fill the last descriptor with End of Packet (EOP) bit */
+		td_cmd |= ICE_TX_DESC_CMD_EOP;
+		txq->nb_tx_used = (uint16_t)(txq->nb_tx_used + nb_used);
+		txq->nb_tx_free = (uint16_t)(txq->nb_tx_free - nb_used);
+
+		/* set RS bit on the last descriptor of one packet */
+		if (txq->nb_tx_used >= txq->tx_rs_thresh) {
+			//printf("Setting RS bit on TXD id=%4u (port=%d queue=%d)\n",
+			//	tx_last, txq->port_id, txq->queue_id);
+
+			td_cmd |= ICE_TX_DESC_CMD_RS;
+
+			/* Update txq RS bit counters */
+			txq->nb_tx_used = 0;
+		}
+		txd->cmd_type_offset_bsz |=
+			rte_cpu_to_le_64(((uint64_t)td_cmd) <<
+					 ICE_TXD_QW1_CMD_S);
+	}
+end_of_tx:
+	/* update Tail register */
+	ICE_PCI_REG_WRITE(txq->qtx_tail, tx_id);
+	txq->tx_tail = tx_id;
+
+	return nb_tx;
 }
 
 uint16_t

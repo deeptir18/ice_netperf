@@ -5,6 +5,7 @@
 #pragma once
 
 #include <rte_mbuf.h>
+#include <rte_ethdev.h>
 
 #include "ice_lan_tx_rx.h"
 
@@ -98,6 +99,8 @@ struct ice_tx_queue {
 	ice_tx_release_mbufs_t tx_rel_mbufs;
 };
 
+int ice_rx_queue_start(struct rte_eth_dev *dev, uint16_t rx_queue_id);
 uint16_t ice_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		       uint16_t nb_pkts);
+uint16_t ice_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts);
 uint16_t ice_xmit_pkt(void *tx_queue, struct rte_mbuf *tx_pkt);

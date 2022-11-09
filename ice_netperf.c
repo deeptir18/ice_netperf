@@ -34,8 +34,8 @@
 #define TX_HTHRESH 0
 #define TX_WTHRESH 0
 #define IPV4_HDR_OFFSET RTE_ETHER_HDR_LEN
-#define UDP_HDR_OFFSET (RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr))
-
+#define UDP_HDR_OFFSET (IPV4_HDR_OFFSET + sizeof(struct rte_ipv4_hdr))
+#define PAYLOAD_OFFSET (UDP_HDR_OFFSET + sizeof(struct rte_udp_hdr))
 
 uint32_t kMagic = 0x6e626368; // 'nbch'
 
@@ -65,6 +65,7 @@ static struct rte_ether_addr my_eth;
 static uint32_t my_ip;
 static size_t payload_len;
 static unsigned int num_queues = 1;
+static unsigned int num_segs = 8;
 uint16_t next_port = 50000;
 struct rte_mempool *rx_mbuf_pool;
 struct rte_mempool *tx_mbuf_pool;
@@ -130,10 +131,13 @@ static int do_server(void)
 {
 	uint8_t port = dpdk_port;
 	struct rte_mbuf *rx_bufs[BURST_SIZE];
-	struct rte_mbuf *tx_bufs[BURST_SIZE];
+    struct rte_mbuf *tx_seg_bufs[BURST_SIZE * num_segs]; // one buf per tx seg
+	struct rte_mbuf *tx_bufs[BURST_SIZE]; // only first seg's buf
 	struct rte_mbuf *buf;
 	struct rte_mbuf *tx_mbuf;
-	uint16_t nb_rx, n_to_tx, nb_tx, i, j, q;
+    struct rte_mbuf *cur_buf, *prev_buf;
+	uint16_t nb_rx, n_to_tx, nb_tx, i, j, k, q;
+    size_t payload_length, payload_len_per_seg, payload_len_remainder;
 	struct ice_rx_queue *rxq;
 	struct ice_tx_queue *txq;
 	struct rte_ether_hdr *ptr_rx_mac_hdr, *ptr_tx_mac_hdr;
@@ -144,7 +148,7 @@ static int do_server(void)
 
 	printf("on server core with num_queues: %d\n", num_queues);
 	printf("\nRunning in server mode. [Ctrl+C to quit]\n");
-
+    n_to_tx = 0;
 	/* Run until the application is quit or killed. */
 	for (;;) {
 		for (q = 0; q < num_queues; q++) {
@@ -156,11 +160,10 @@ static int do_server(void)
 			if (nb_rx == 0)
 				continue;
 
-			printf("Nb_rx: %d\n", nb_rx);
-			n_to_tx = 0;
+			printf("nb_rx: %d\t", nb_rx);
 			for (i = 0; i < nb_rx; i++) {
 				buf = rx_bufs[i];
-
+                
 				if (!check_eth_hdr(buf))
 					goto free_buf;
 
@@ -174,7 +177,7 @@ static int do_server(void)
 					printf("deep copy of rx_mbuf failed\n");
 					return -1;
 				}
-
+                
 				/* swap src and dst ether addresses */
 				ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
 				ptr_tx_mac_hdr = rte_pktmbuf_mtod(tx_mbuf, struct rte_ether_hdr *);
@@ -230,29 +233,69 @@ static int do_server(void)
 //					buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
 //				}
 
-				printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
-				printf("rx_mbuf data ptr: %p\n", buf->buf_addr);				
-				tx_bufs[n_to_tx++] = tx_mbuf;
-				rte_pktmbuf_free(buf);
+				//printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
+				//printf("rx_mbuf data ptr: %p\n", buf->buf_addr);
+                
+                // The pkt_len of the first mbuf (tx_mbuf) should be the length
+                // of the whole packet (incl. header and all segs). This is set
+                // correctly when we do a deep copy of rx_mbuf to create tx_mbuf.
+                payload_length = tx_mbuf->pkt_len - PAYLOAD_OFFSET;
+                payload_len_per_seg = payload_length / num_segs;
+                payload_len_remainder = payload_length % num_segs;
+                
+                // The first mbuf stores how many segs make up the packet.
+                tx_mbuf->nb_segs = num_segs;
+                // The first mbuf contains the header and the first payload seg
+                tx_mbuf->data_len = PAYLOAD_OFFSET + payload_len_per_seg;
+                // tx_seg_bufs stores all mbufs for the packets to be transmitted
+                tx_seg_bufs[n_to_tx * num_segs] = tx_mbuf;
+                // create the rest of the mbufs for the packet (1 mbuf per seg)
+                for (k = 1; k < num_segs; k++) {
+                    cur_buf = rte_pktmbuf_alloc(tx_mbuf_pool);
+                    // The last seg contains the remainder of the payload
+                    if (k == num_segs - 1) {
+                        cur_buf->data_len = payload_len_per_seg + payload_len_remainder;
+                        cur_buf->next = NULL;
+                    } else {
+                        cur_buf->data_len = payload_len_per_seg;
+                    }
+                    
+                    // virtual address of the data
+                    cur_buf->buf_addr = (char *)(rte_pktmbuf_mtod_offset(tx_mbuf, char *,
+                            PAYLOAD_OFFSET + payload_length / num_segs * k));
+                    cur_buf->data_off = 0;
+                    // physical address of the data
+                    cur_buf->buf_iova = rte_pktmbuf_iova_offset(tx_mbuf,
+                            PAYLOAD_OFFSET + payload_length / num_segs * k);
+                    rte_mbuf_refcnt_set(cur_buf, 1);
+                    tx_seg_bufs[n_to_tx * num_segs + k] = cur_buf;
+                    // set the cur mbuf to be the next seg for the prev mbuf
+                    prev_buf = tx_seg_bufs[n_to_tx * num_segs + k - 1];
+                    prev_buf->next = cur_buf;
+                }
+                tx_bufs[n_to_tx++] = tx_seg_bufs[n_to_tx * num_segs];
+				rte_pktmbuf_free(buf); // free rx mbuf
 				continue;
 
 			free_buf:
 				/* packet wasn't sent, free it */
 				rte_pktmbuf_free(buf);
 			}
-
+            
 			/* transmit packets */
 			nb_tx = 0;
 			txq = data->tx_queues[q];
-			for (j = 0; j < n_to_tx; j++) {
-				nb_tx += ice_xmit_pkt(txq, tx_bufs[j]);
-				rte_pktmbuf_free(tx_bufs[j]);
-				rte_pktmbuf_free(rx_bufs[j]);
-			}
-
-			if (nb_tx != n_to_tx)
-				printf("error: could not transmit all packets: %d %d\n",
-					n_to_tx, nb_tx);
+            if (n_to_tx > 1) {
+                nb_tx += ice_xmit_pkts(txq, tx_bufs, n_to_tx);
+                if (nb_tx != n_to_tx)
+                    printf("error: could not transmit all packets: %d %d\n",
+                        n_to_tx, nb_tx);
+		else
+			printf("nb_tx: %u\n", nb_tx);
+                n_to_tx = 0;
+            }
+				//rte_pktmbuf_free(tx_bufs[j]); -- freeing of tx buf should be done in cleanup
+				//nb_tx should be able to return 0 if failed, in which case we retry.
 		}
 	}
 
@@ -378,6 +421,7 @@ static int init_dpdk(int argc, char *argv[])
 	
 	/* port initialization. set up rx/tx queues */
         init_port(dpdk_port, rx_mbuf_pool);
+//	ice_rx_queue_start(&rte_eth_devices[0], 0);
 
 
         data = rte_eth_devices[0].data;
