@@ -22,6 +22,54 @@ struct ice_rx_entry {
 	struct rte_mbuf *mbuf;
 };
 
+//struct ice_vsi {
+//	struct ice_adapter *adapter; /* Backreference to associated adapter */
+//	struct ice_aqc_vsi_props info; /* VSI properties */
+//	/**
+//	 * When drivers loaded, only a default main VSI exists. In case new VSI
+//	 * needs to add, HW needs to know the layout that VSIs are organized.
+//	 * Besides that, VSI isan element and can't switch packets, which needs
+//	 * to add new component VEB to perform switching. So, a new VSI needs
+//	 * to specify the uplink VSI (Parent VSI) before created. The
+//	 * uplink VSI will check whether it had a VEB to switch packets. If no,
+//	 * it will try to create one. Then, uplink VSI will move the new VSI
+//	 * into its' sib_vsi_list to manage all the downlink VSI.
+//	 *  sib_vsi_list: the VSI list that shared the same uplink VSI.
+//	 *  parent_vsi  : the uplink VSI. It's NULL for main VSI.
+//	 *  veb         : the VEB associates with the VSI.
+//	 */
+//	struct ice_vsi_list sib_vsi_list; /* sibling vsi list */
+//	struct ice_vsi *parent_vsi;
+//	enum ice_vsi_type type; /* VSI types */
+//	uint16_t vlan_num;       /* Total VLAN number */
+//	uint16_t mac_num;        /* Total mac number */
+//	struct ice_mac_filter_list mac_list; /* macvlan filter list */
+//	struct ice_vlan_filter_list vlan_list; /* vlan filter list */
+//	uint16_t nb_qps;         /* Number of queue pairs VSI can occupy */
+//	uint16_t nb_used_qps;    /* Number of queue pairs VSI uses */
+//	uint16_t max_macaddrs;   /* Maximum number of MAC addresses */
+//	uint16_t base_queue;     /* The first queue index of this VSI */
+//	uint16_t vsi_id;         /* Hardware Id */
+//	uint16_t idx;            /* vsi_handle: SW index in hw->vsi_ctx */
+//	/* VF number to which the VSI connects, valid when VSI is VF type */
+//	uint8_t vf_num;
+//	uint16_t msix_intr; /* The MSIX interrupt binds to VSI */
+//	uint16_t nb_msix;   /* The max number of msix vector */
+//	uint8_t enabled_tc; /* The traffic class enabled */
+//	uint8_t vlan_anti_spoof_on; /* The VLAN anti-spoofing enabled */
+//	uint8_t vlan_filter_on; /* The VLAN filter enabled */
+//	/* information about rss configuration */
+//	u32 rss_key_size;
+//	u32 rss_lut_size;
+//	uint8_t *rss_lut;
+//	uint8_t *rss_key;
+//	struct ice_eth_stats eth_stats_offset;
+//	struct ice_eth_stats eth_stats;
+//	bool offset_loaded;
+//	uint64_t old_rx_bytes;
+//	uint64_t old_tx_bytes;
+//};
+
 struct ice_rx_queue {
 	struct rte_mempool *mp; /* mbuf pool to populate RX ring */
 	volatile union ice_rx_flex_desc *rx_ring;/* RX ring virtual address */

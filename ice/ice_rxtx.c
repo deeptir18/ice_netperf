@@ -284,6 +284,109 @@ ice_recv_pkts(void *rx_queue,
 	return nb_rx;
 }
 
+//uint16_t
+//ice_recv_pkts(void *rx_queue,
+//	      struct rte_mbuf **rx_pkts,
+//	      uint16_t nb_pkts)
+//{
+//	struct ice_rx_queue *rxq = rx_queue;
+//	volatile union ice_rx_flex_desc *rx_ring = rxq->rx_ring;
+//	volatile union ice_rx_flex_desc *rxdp;
+//	union ice_rx_flex_desc rxd;
+//	struct ice_rx_entry *sw_ring = rxq->sw_ring;
+//	struct ice_rx_entry *rxe;
+//	struct rte_mbuf *nmb; /* new allocated mbuf */
+//	struct rte_mbuf *nmb_pay; /* new allocated payload mbuf */
+//	struct rte_mbuf *rxm; /* pointer to store old mbuf in SW ring */
+//	uint16_t rx_id = rxq->rx_tail;
+//	uint16_t nb_rx = 0;
+//	uint16_t nb_hold = 0;
+//	uint16_t rx_packet_len;
+//	uint16_t rx_header_len;
+//	uint16_t rx_stat_err0;
+//	uint64_t dma_addr;
+//	uint64_t pkt_flags;
+//	uint32_t *ptype_tbl = rxq->vsi->adapter->ptype_tbl;
+//
+//	while (nb_rx < nb_pkts) {
+//		rxdp = &rx_ring[rx_id];
+//		rx_stat_err0 = rte_le_to_cpu_16(rxdp->wb.status_error0);
+//
+//		/* Check the DD bit first */
+//		if (!(rx_stat_err0 & (1 << ICE_RX_FLEX_DESC_STATUS0_DD_S)))
+//			break;
+//
+//		/* allocate header mbuf */
+//		nmb = rte_mbuf_raw_alloc(rxq->mp);
+//		if (unlikely(!nmb)) {
+//			rxq->vsi->adapter->pf.dev_data->rx_mbuf_alloc_failed++;
+//			break;
+//		}
+//
+//		rxd = *rxdp; /* copy descriptor in ring to temp variable*/
+//
+//		nb_hold++;
+//		rxe = &sw_ring[rx_id]; /* get corresponding mbuf in SW ring */
+//		rx_id++;
+//		if (unlikely(rx_id == rxq->nb_rx_desc))
+//			rx_id = 0;
+//		rxm = rxe->mbuf;
+//		rxe->mbuf = nmb;
+//		dma_addr =
+//			rte_cpu_to_le_64(rte_mbuf_data_iova_default(nmb));
+//
+//		/**
+//		 * fill the read format of descriptor with physic address in
+//		 * new allocated mbuf: nmb
+//		 */
+//		rxdp->read.hdr_addr = 0;
+//		rxdp->read.pkt_addr = dma_addr;
+//
+//		/* fill old mbuf with received descriptor: rxd */
+//		rxm->data_off = RTE_PKTMBUF_HEADROOM;
+//		rte_prefetch0(RTE_PTR_ADD(rxm->buf_addr, RTE_PKTMBUF_HEADROOM));
+//		rxm->nb_segs = 1;
+//		rxm->next = NULL;
+//		/* calculate rx_packet_len of the received pkt */
+//		rx_packet_len = (rte_le_to_cpu_16(rxd.wb.pkt_len) &
+//				ICE_RX_FLX_DESC_PKT_LEN_M) - rxq->crc_len;
+//		rxm->data_len = rx_packet_len;
+//		rxm->pkt_len = rx_packet_len;
+//
+//		rxm->port = rxq->port_id;
+//		rxm->packet_type = ptype_tbl[ICE_RX_FLEX_DESC_PTYPE_M &
+//			rte_le_to_cpu_16(rxd.wb.ptype_flex_flags0)];
+//		ice_rxd_to_vlan_tci(rxm, &rxd);
+//		rxd_to_pkt_fields_ops[rxq->rxdid](rxq, rxm, &rxd);
+//		pkt_flags = ice_rxd_error_to_pkt_flags(rx_stat_err0);
+//
+//		rxm->ol_flags |= pkt_flags;
+//		/* copy old mbuf to rx_pkts */
+//		rx_pkts[nb_rx++] = rxm;
+//	}
+//
+//	rxq->rx_tail = rx_id;
+//	/**
+//	 * If the number of free RX descriptors is greater than the RX free
+//	 * threshold of the queue, advance the receive tail register of queue.
+//	 * Update that register with the value of the last processed RX
+//	 * descriptor minus 1.
+//	 */
+//	nb_hold = (uint16_t)(nb_hold + rxq->nb_rx_hold);
+//	if (nb_hold > rxq->rx_free_thresh) {
+//		rx_id = (uint16_t)(rx_id == 0 ?
+//				   (rxq->nb_rx_desc - 1) : (rx_id - 1));
+//		/* write TAIL register */
+//		ICE_PCI_REG_WRITE(rxq->qrx_tail, rx_id);
+//		nb_hold = 0;
+//	}
+//	rxq->nb_rx_hold = nb_hold;
+//
+//	/* return received packet in the burst */
+//	return nb_rx;
+//}
+
+
 static inline void
 ice_txd_enable_checksum(uint64_t ol_flags,
 			uint32_t *td_cmd,

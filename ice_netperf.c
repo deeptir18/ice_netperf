@@ -17,7 +17,7 @@
 
 #include "ice/ice_rxtx.h"
 
-#define BURST_SIZE 4000
+#define BURST_SIZE 32
 #define MBUF_BUF_SIZE RTE_ETHER_MAX_JUMBO_FRAME_LEN + RTE_PKTMBUF_HEADROOM
 // 8000 is number of mbufs in the pool. These mbufs are ref counted and 
 // added to the pool again once they are done being used for rx/tx a packet.
@@ -70,6 +70,7 @@ uint16_t next_port = 50000;
 struct rte_mempool *rx_mbuf_pool;
 struct rte_mempool *tx_mbuf_pool;
 
+struct rte_eth_dev *dev;
 struct rte_eth_dev_data *data;
 
 /* ice_netperf.c: simple implementation of netperf server for ice-compatible NICs */
@@ -131,13 +132,14 @@ static int do_server(void)
 {
 	uint8_t port = dpdk_port;
 	struct rte_mbuf *rx_bufs[BURST_SIZE];
-    struct rte_mbuf *tx_seg_bufs[BURST_SIZE * num_segs]; // one buf per tx seg
+    	struct rte_mbuf *tx_seg_bufs[BURST_SIZE * num_segs]; // one buf per tx seg
 	struct rte_mbuf *tx_bufs[BURST_SIZE]; // only first seg's buf
 	struct rte_mbuf *buf;
 	struct rte_mbuf *tx_mbuf;
-    struct rte_mbuf *cur_buf, *prev_buf;
+    	struct rte_mbuf *cur_buf, *prev_buf;
+	char *rx_data, *tx_data;
 	uint16_t nb_rx, n_to_tx, nb_tx, i, j, k, q;
-    size_t payload_length, payload_len_per_seg, payload_len_remainder;
+    	size_t payload_length, payload_len_per_seg, payload_len_remainder;
 	struct ice_rx_queue *rxq;
 	struct ice_tx_queue *txq;
 	struct rte_ether_hdr *ptr_rx_mac_hdr, *ptr_tx_mac_hdr;
@@ -148,19 +150,20 @@ static int do_server(void)
 
 	printf("on server core with num_queues: %d\n", num_queues);
 	printf("\nRunning in server mode. [Ctrl+C to quit]\n");
-    n_to_tx = 0;
+    	n_to_tx = 0;
 	/* Run until the application is quit or killed. */
 	for (;;) {
 		for (q = 0; q < num_queues; q++) {
 
 			/* receive packets */
 			rxq = data->rx_queues[q];
-			nb_rx = ice_recv_pkts(rxq, rx_bufs, BURST_SIZE);
+			//nb_rx = ice_recv_pkts(rxq, rx_bufs, BURST_SIZE);
 
+			nb_rx = rte_eth_rx_burst(port, q, rx_bufs, BURST_SIZE);
 			if (nb_rx == 0)
 				continue;
 
-			printf("nb_rx: %d\t", nb_rx);
+//			printf("nb_rx: %d\t", nb_rx);
 			for (i = 0; i < nb_rx; i++) {
 				buf = rx_bufs[i];
                 
@@ -172,12 +175,28 @@ static int do_server(void)
 					goto free_buf;
 
 				/* allocate buf in tx mempool and copy rx_buf into it */
-				tx_mbuf = rte_pktmbuf_copy(buf, tx_mbuf_pool, 0, UINT32_MAX);
+				//tx_mbuf = rte_pktmbuf_copy(buf, tx_mbuf_pool, 0, UINT32_MAX);
+				tx_mbuf = rte_pktmbuf_alloc(tx_mbuf_pool);
 				if (tx_mbuf == NULL) {
 					printf("deep copy of rx_mbuf failed\n");
 					return -1;
 				}
-                
+
+				// Payload length is packet len minus headers
+                                payload_length = buf->pkt_len - PAYLOAD_OFFSET;
+                                payload_len_per_seg = payload_length / num_segs;
+                                payload_len_remainder = payload_length % num_segs;
+
+                                // The first mbuf stores how many segs make up the packet.
+                                tx_mbuf->nb_segs = num_segs;
+                                // The first mbuf contains the header and the first payload seg
+                                tx_mbuf->data_len = PAYLOAD_OFFSET + payload_len_per_seg;
+				
+				/* copy rx mbuf data into tx_data */
+				tx_data = (char *)(rte_pktmbuf_mtod_offset(tx_mbuf, char *, 0));
+				rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*, 0));
+				rte_memcpy(tx_data, rx_data, PAYLOAD_OFFSET + payload_len_per_seg);
+
 				/* swap src and dst ether addresses */
 				ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
 				ptr_tx_mac_hdr = rte_pktmbuf_mtod(tx_mbuf, struct rte_ether_hdr *);
@@ -200,105 +219,60 @@ static int do_server(void)
 				ptr_tx_udp_hdr->src_port = ptr_rx_udp_hdr->dst_port;
 				ptr_tx_udp_hdr->dst_port = ptr_rx_udp_hdr->src_port;
 
-
-				/* check if this is a control message and we need to reply with
-				 * ports */
-//				control_req = rte_pktmbuf_mtod_offset(buf, struct nbench_req *,
-//								RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr) +
-//								sizeof(struct rte_udp_hdr));
-//				if (control_req->magic == kMagic) {
-//					rte_pktmbuf_append(buf, sizeof(struct nbench_resp) +
-//							sizeof(uint16_t) *
-//							control_req->nports -
-//							sizeof(struct nbench_req));
-//					control_resp = (struct nbench_resp *) control_req;
-//
-//					/* add ports to response */
-//					for (j = 0; j < control_req->nports; j++) {
-//						/* simple port allocation */
-//						control_resp->ports[j] = rte_cpu_to_be_16(next_port++);
-//					}
-//
-//					/* adjust lengths in UDP and IPv4 headers */
-//					payload_len = sizeof(struct nbench_resp) +
-//						sizeof(uint16_t) * control_req->nports;
-//					rte_udp_hdr->dgram_len = rte_cpu_to_be_16(sizeof(struct rte_udp_hdr) +
-//									payload_len);
-//					ptr_ipv4_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
-//										sizeof(struct rte_udp_hdr) + payload_len);
-//
-//					/* enable computation of IPv4 checksum in hardware */
-//					ptr_ipv4_hdr->hdr_checksum = 0;
-//					/* lengths filled in by ice_rxtx.c */
-//					buf->ol_flags = RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_IPV4;
-//				}
-
 				//printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
 				//printf("rx_mbuf data ptr: %p\n", buf->buf_addr);
                 
-                // The pkt_len of the first mbuf (tx_mbuf) should be the length
-                // of the whole packet (incl. header and all segs). This is set
-                // correctly when we do a deep copy of rx_mbuf to create tx_mbuf.
-                payload_length = tx_mbuf->pkt_len - PAYLOAD_OFFSET;
-                payload_len_per_seg = payload_length / num_segs;
-                payload_len_remainder = payload_length % num_segs;
                 
-                // The first mbuf stores how many segs make up the packet.
-                tx_mbuf->nb_segs = num_segs;
-                // The first mbuf contains the header and the first payload seg
-                tx_mbuf->data_len = PAYLOAD_OFFSET + payload_len_per_seg;
-                // tx_seg_bufs stores all mbufs for the packets to be transmitted
-                tx_seg_bufs[n_to_tx * num_segs] = tx_mbuf;
-                // create the rest of the mbufs for the packet (1 mbuf per seg)
-                for (k = 1; k < num_segs; k++) {
-                    cur_buf = rte_pktmbuf_alloc(tx_mbuf_pool);
-                    // The last seg contains the remainder of the payload
-                    if (k == num_segs - 1) {
-                        cur_buf->data_len = payload_len_per_seg + payload_len_remainder;
-                        cur_buf->next = NULL;
-                    } else {
-                        cur_buf->data_len = payload_len_per_seg;
-                    }
-                    
-                    // virtual address of the data
-                    cur_buf->buf_addr = (char *)(rte_pktmbuf_mtod_offset(tx_mbuf, char *,
-                            PAYLOAD_OFFSET + payload_length / num_segs * k));
-                    cur_buf->data_off = 0;
-                    // physical address of the data
-                    cur_buf->buf_iova = rte_pktmbuf_iova_offset(tx_mbuf,
-                            PAYLOAD_OFFSET + payload_length / num_segs * k);
-                    rte_mbuf_refcnt_set(cur_buf, 1);
-                    tx_seg_bufs[n_to_tx * num_segs + k] = cur_buf;
-                    // set the cur mbuf to be the next seg for the prev mbuf
-                    prev_buf = tx_seg_bufs[n_to_tx * num_segs + k - 1];
-                    prev_buf->next = cur_buf;
-                }
-                tx_bufs[n_to_tx++] = tx_seg_bufs[n_to_tx * num_segs];
+		                // tx_seg_bufs stores all mbufs for the packets to be transmitted
+		                tx_seg_bufs[n_to_tx * num_segs] = tx_mbuf;
+		                // create the rest of the mbufs for the packet (1 mbuf per seg)
+		                for (k = 1; k < num_segs; k++) {
+		                    	cur_buf = rte_pktmbuf_alloc(tx_mbuf_pool);
+		                   	// The last seg contains the remainder of the payload
+		                   	if (k == num_segs - 1) {
+						cur_buf->data_len = payload_len_per_seg + payload_len_remainder;
+						cur_buf->next = NULL;
+		                   	} else {
+					 	cur_buf->data_len = payload_len_per_seg;
+					}
+
+					// copy relevant data from rx mbuf into this seg
+					char *tx_data = (char *)(rte_pktmbuf_mtod_offset(cur_buf, char *, 0));
+                                	char *rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*, 
+								PAYLOAD_OFFSET + payload_len_per_seg * k));
+                                	rte_memcpy(tx_data, rx_data, cur_buf->data_len);
+		                   	
+					tx_seg_bufs[n_to_tx * num_segs + k] = cur_buf;
+		                   	// set the cur mbuf to be the next seg for the prev mbuf
+		                   	prev_buf = tx_seg_bufs[n_to_tx * num_segs + k - 1];
+		                   	prev_buf->next = cur_buf;
+		                }
+		                tx_bufs[n_to_tx++] = tx_seg_bufs[n_to_tx * num_segs];
 				rte_pktmbuf_free(buf); // free rx mbuf
 				continue;
 
-			free_buf:
-				/* packet wasn't sent, free it */
-				rte_pktmbuf_free(buf);
+				free_buf:
+					/* packet wasn't sent, free it */
+					rte_pktmbuf_free(buf);
 			}
             
 			/* transmit packets */
 			nb_tx = 0;
 			txq = data->tx_queues[q];
-            if (n_to_tx > 1) {
-                nb_tx += ice_xmit_pkts(txq, tx_bufs, n_to_tx);
-                if (nb_tx != n_to_tx)
-                    printf("error: could not transmit all packets: %d %d\n",
-                        n_to_tx, nb_tx);
-		else
-			printf("nb_tx: %u\n", nb_tx);
-                n_to_tx = 0;
-            }
+            		if (n_to_tx > 0) {
+                		nb_tx += ice_xmit_pkts(txq, tx_bufs, n_to_tx);
+                		if (nb_tx != n_to_tx) {
+                    			printf("error: could not transmit all packets: %d %d\n",
+                        			n_to_tx, nb_tx);
+				} else {
+//					printf("nb_tx: %u\n", nb_tx);
+				}
+                		n_to_tx = 0;
+            		}
 				//rte_pktmbuf_free(tx_bufs[j]); -- freeing of tx buf should be done in cleanup
 				//nb_tx should be able to return 0 if failed, in which case we retry.
 		}
 	}
-
 	return 0;
 }
 
@@ -423,8 +397,11 @@ static int init_dpdk(int argc, char *argv[])
         init_port(dpdk_port, rx_mbuf_pool);
 //	ice_rx_queue_start(&rte_eth_devices[0], 0);
 
-
-        data = rte_eth_devices[0].data;
+	dev = &rte_eth_devices[0];
+//	dev->rx_pkt_burst = ice_recv_pkts;
+//	struct rte_eth_fp_ops *fp = &rte_eth_fp_ops[0];
+//	fp->rx_pkt_burst = ice_recv_pkts;
+        data = dev->data;
         rte_ether_addr_copy(&data->mac_addrs[0], &my_eth); // same as rte_eth_macaddr_get()
         printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
                            " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
