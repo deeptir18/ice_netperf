@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -51,8 +52,8 @@ struct nbench_resp {
 };
 
 enum {
-	MODE_UDP_CLIENT = 0,
-	MODE_UDP_SERVER,
+	MODE_NOCOPY = 0,
+	MODE_COPY,
 };
 
 #define MAKE_IP_ADDR(a, b, c, d)			\
@@ -60,12 +61,12 @@ enum {
 	 ((uint32_t) c << 8) | (uint32_t) d)
 
 static unsigned int dpdk_port = 0;
-static uint8_t mode;
+static uint8_t mode = MODE_NOCOPY;
 static struct rte_ether_addr my_eth;
 static uint32_t my_ip;
 static size_t payload_len;
 static unsigned int num_queues = 1;
-static unsigned int num_segs = 8;
+static int num_segs = 1;
 uint16_t next_port = 50000;
 struct rte_mempool *rx_mbuf_pool;
 struct rte_mempool *tx_mbuf_pool;
@@ -173,82 +174,109 @@ static int do_server(void)
 				/* this packet is IPv4, check IP header */
 				if (!check_ip_hdr(buf))
 					goto free_buf;
+                                
+				if (mode == MODE_COPY) {
 
-				/* allocate buf in tx mempool and copy rx_buf into it */
-				//tx_mbuf = rte_pktmbuf_copy(buf, tx_mbuf_pool, 0, UINT32_MAX);
-				tx_mbuf = rte_pktmbuf_alloc(tx_mbuf_pool);
-				if (tx_mbuf == NULL) {
-					printf("deep copy of rx_mbuf failed\n");
-					return -1;
+					/* allocate buf in tx mempool and copy rx_buf into it */
+					//tx_mbuf = rte_pktmbuf_copy(buf, tx_mbuf_pool, 0, UINT32_MAX);
+					tx_mbuf = rte_pktmbuf_alloc(tx_mbuf_pool);
+					if (tx_mbuf == NULL) {
+						printf("deep copy of rx_mbuf failed\n");
+						return -1;
+					}
+	
+					// Payload length is packet len minus headers
+	                                payload_length = buf->pkt_len - PAYLOAD_OFFSET;
+	                                payload_len_per_seg = payload_length / num_segs;
+	                                payload_len_remainder = payload_length % num_segs;
+
+	                                // The first mbuf stores how many segs make up the packet.
+	                                tx_mbuf->nb_segs = num_segs;
+	                                // The first mbuf contains the header and the first payload seg
+	                                tx_mbuf->data_len = PAYLOAD_OFFSET + payload_len_per_seg;
+					tx_mbuf->next = NULL;
+	
+					/* copy rx mbuf data into tx_data */
+					tx_data = (char *)(rte_pktmbuf_mtod_offset(tx_mbuf, char *, 0));
+					rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*, 0));
+					rte_memcpy(tx_data, rx_data, PAYLOAD_OFFSET + payload_len_per_seg);
+
+					/* swap src and dst ether addresses -- copy */
+                                        ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
+                                        ptr_tx_mac_hdr = rte_pktmbuf_mtod(tx_mbuf, struct rte_ether_hdr *);
+                                        rte_ether_addr_copy(&ptr_rx_mac_hdr->src_addr, &ptr_tx_mac_hdr->dst_addr);
+                                        rte_ether_addr_copy(&ptr_rx_mac_hdr->dst_addr, &ptr_tx_mac_hdr->src_addr);
+
+					/* swap src and dst IP addresses -- copy */
+                                        ptr_rx_ipv4_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_ipv4_hdr *,
+                                                                        IPV4_HDR_OFFSET);
+                                        ptr_tx_ipv4_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_ipv4_hdr *,
+                                                                        IPV4_HDR_OFFSET);
+                                        ptr_tx_ipv4_hdr->src_addr = ptr_rx_ipv4_hdr->dst_addr;
+                                        ptr_tx_ipv4_hdr->dst_addr = ptr_rx_ipv4_hdr->src_addr;
+
+					/* swap UDP ports */
+                                	ptr_rx_udp_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_udp_hdr *,
+                                	                                UDP_HDR_OFFSET);
+                                	ptr_tx_udp_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_udp_hdr *,
+                                	                                UDP_HDR_OFFSET);
+                                	ptr_tx_udp_hdr->src_port = ptr_rx_udp_hdr->dst_port;
+                                	ptr_tx_udp_hdr->dst_port = ptr_rx_udp_hdr->src_port;
+
+					// tx_seg_bufs stores all mbufs for the packets to be transmitted
+                                	tx_seg_bufs[n_to_tx * num_segs] = tx_mbuf;
+                                	// create the rest of the mbufs for the packet (1 mbuf per seg)
+                                	for (k = 1; k < num_segs; k++) {
+                                	        cur_buf = rte_pktmbuf_alloc(tx_mbuf_pool);
+                                	        // The last seg contains the remainder of the payload
+                                	        if (k == num_segs - 1) {
+                                	                cur_buf->data_len = payload_len_per_seg + payload_len_remainder;
+                                	                cur_buf->next = NULL;
+                                	        } else {
+                                	                cur_buf->data_len = payload_len_per_seg;
+                                	        }
+
+                                	        // copy relevant data from rx mbuf into this seg
+                                	        char *tx_data = (char *)(rte_pktmbuf_mtod_offset(cur_buf, char *, 0));
+                                	        char *rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*,
+                                	                                PAYLOAD_OFFSET + payload_len_per_seg * k));
+                                	        rte_memcpy(tx_data, rx_data, cur_buf->data_len);
+
+                                	        tx_seg_bufs[n_to_tx * num_segs + k] = cur_buf;
+                                	        // set the cur mbuf to be the next seg for the prev mbuf
+                                	        prev_buf = tx_seg_bufs[n_to_tx * num_segs + k - 1];
+                                	        prev_buf->next = cur_buf;
+                                	}
+                                	tx_bufs[n_to_tx++] = tx_seg_bufs[n_to_tx * num_segs];
+                                	rte_pktmbuf_free(buf); // free rx mbuf
+				} else {
+
+					/* swap src and dst ether addresses -- no copy */
+					struct rte_ether_addr src_addr;
+					ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
+					rte_ether_addr_copy(&ptr_rx_mac_hdr->src_addr, &src_addr);
+					rte_ether_addr_copy(&ptr_rx_mac_hdr->dst_addr, &ptr_rx_mac_hdr->src_addr);
+					rte_ether_addr_copy(&src_addr, &ptr_rx_mac_hdr->dst_addr);
+
+					/* swap src and dst IP addresses -- no copy */
+					uint32_t src_ip_addr;
+					ptr_rx_ipv4_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_ipv4_hdr *,
+									IPV4_HDR_OFFSET);
+					src_ip_addr = ptr_rx_ipv4_hdr->src_addr;
+					ptr_rx_ipv4_hdr->src_addr = ptr_rx_ipv4_hdr->dst_addr;
+					ptr_rx_ipv4_hdr->dst_addr = src_ip_addr;
+
+					/* swap UDP ports -- no copy */
+					uint16_t tmp_port;
+					ptr_rx_udp_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_udp_hdr *,
+									UDP_HDR_OFFSET);
+					tmp_port = ptr_rx_udp_hdr->src_port;
+					ptr_rx_udp_hdr->src_port = ptr_rx_udp_hdr->dst_port;
+					ptr_rx_udp_hdr->dst_port = tmp_port;
+
+					tx_bufs[n_to_tx++] = buf;
 				}
 
-				// Payload length is packet len minus headers
-                                payload_length = buf->pkt_len - PAYLOAD_OFFSET;
-                                payload_len_per_seg = payload_length / num_segs;
-                                payload_len_remainder = payload_length % num_segs;
-
-                                // The first mbuf stores how many segs make up the packet.
-                                tx_mbuf->nb_segs = num_segs;
-                                // The first mbuf contains the header and the first payload seg
-                                tx_mbuf->data_len = PAYLOAD_OFFSET + payload_len_per_seg;
-				
-				/* copy rx mbuf data into tx_data */
-				tx_data = (char *)(rte_pktmbuf_mtod_offset(tx_mbuf, char *, 0));
-				rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*, 0));
-				rte_memcpy(tx_data, rx_data, PAYLOAD_OFFSET + payload_len_per_seg);
-
-				/* swap src and dst ether addresses */
-				ptr_rx_mac_hdr = rte_pktmbuf_mtod(buf, struct rte_ether_hdr *);
-				ptr_tx_mac_hdr = rte_pktmbuf_mtod(tx_mbuf, struct rte_ether_hdr *);
-				rte_ether_addr_copy(&ptr_rx_mac_hdr->src_addr, &ptr_tx_mac_hdr->dst_addr);
-				rte_ether_addr_copy(&ptr_rx_mac_hdr->dst_addr, &ptr_tx_mac_hdr->src_addr);
-
-				/* swap src and dst IP addresses */
-				ptr_rx_ipv4_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_ipv4_hdr *,
-								IPV4_HDR_OFFSET);
-				ptr_tx_ipv4_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_ipv4_hdr *,
-					       			IPV4_HDR_OFFSET);
-				ptr_tx_ipv4_hdr->src_addr = ptr_rx_ipv4_hdr->dst_addr;
-				ptr_tx_ipv4_hdr->dst_addr = ptr_rx_ipv4_hdr->src_addr;
-
-				/* swap UDP ports */
-				ptr_rx_udp_hdr = rte_pktmbuf_mtod_offset(buf, struct rte_udp_hdr *,
-								UDP_HDR_OFFSET);
-				ptr_tx_udp_hdr = rte_pktmbuf_mtod_offset(tx_mbuf, struct rte_udp_hdr *,
-								UDP_HDR_OFFSET);
-				ptr_tx_udp_hdr->src_port = ptr_rx_udp_hdr->dst_port;
-				ptr_tx_udp_hdr->dst_port = ptr_rx_udp_hdr->src_port;
-
-				//printf("tx_mbuf data ptr: %p\t", tx_mbuf->buf_addr);
-				//printf("rx_mbuf data ptr: %p\n", buf->buf_addr);
-                
-                
-		                // tx_seg_bufs stores all mbufs for the packets to be transmitted
-		                tx_seg_bufs[n_to_tx * num_segs] = tx_mbuf;
-		                // create the rest of the mbufs for the packet (1 mbuf per seg)
-		                for (k = 1; k < num_segs; k++) {
-		                    	cur_buf = rte_pktmbuf_alloc(tx_mbuf_pool);
-		                   	// The last seg contains the remainder of the payload
-		                   	if (k == num_segs - 1) {
-						cur_buf->data_len = payload_len_per_seg + payload_len_remainder;
-						cur_buf->next = NULL;
-		                   	} else {
-					 	cur_buf->data_len = payload_len_per_seg;
-					}
-
-					// copy relevant data from rx mbuf into this seg
-					char *tx_data = (char *)(rte_pktmbuf_mtod_offset(cur_buf, char *, 0));
-                                	char *rx_data = (char *)(rte_pktmbuf_mtod_offset(buf, char*, 
-								PAYLOAD_OFFSET + payload_len_per_seg * k));
-                                	rte_memcpy(tx_data, rx_data, cur_buf->data_len);
-		                   	
-					tx_seg_bufs[n_to_tx * num_segs + k] = cur_buf;
-		                   	// set the cur mbuf to be the next seg for the prev mbuf
-		                   	prev_buf = tx_seg_bufs[n_to_tx * num_segs + k - 1];
-		                   	prev_buf->next = cur_buf;
-		                }
-		                tx_bufs[n_to_tx++] = tx_seg_bufs[n_to_tx * num_segs];
-				rte_pktmbuf_free(buf); // free rx mbuf
 				continue;
 
 				free_buf:
@@ -265,9 +293,9 @@ static int do_server(void)
                     			printf("error: could not transmit all packets: %d %d\n",
                         			n_to_tx, nb_tx);
 				} else {
+					n_to_tx = 0;
 //					printf("nb_tx: %u\n", nb_tx);
 				}
-                		n_to_tx = 0;
             		}
 				//rte_pktmbuf_free(tx_bufs[j]); -- freeing of tx buf should be done in cleanup
 				//nb_tx should be able to return 0 if failed, in which case we retry.
@@ -370,13 +398,13 @@ static int init_dpdk(int argc, char *argv[])
 {
         dpdk_port = 0;
 
-        int status = rte_eal_init(argc, argv);
-        if (status < 0) {
-                printf("failed rte_eal_init: %d\n", status);
+        int args_parsed = rte_eal_init(argc, argv);
+        if (args_parsed < 0) {
+                printf("failed rte_eal_init: %d\n", args_parsed);
+		return -1;
         }
 
         str_to_ip("192.168.1.11", &my_ip);
-        mode = MODE_UDP_SERVER;
 
         const uint16_t nbports = rte_eth_dev_count_avail();
         printf("Number of ports available: %d\n", nbports);
@@ -395,7 +423,6 @@ static int init_dpdk(int argc, char *argv[])
 	
 	/* port initialization. set up rx/tx queues */
         init_port(dpdk_port, rx_mbuf_pool);
-//	ice_rx_queue_start(&rte_eth_devices[0], 0);
 
 	dev = &rte_eth_devices[0];
 //	dev->rx_pkt_burst = ice_recv_pkts;
@@ -409,7 +436,40 @@ static int init_dpdk(int argc, char *argv[])
                         my_eth.addr_bytes[0], my_eth.addr_bytes[1],
                         my_eth.addr_bytes[2], my_eth.addr_bytes[3],
                         my_eth.addr_bytes[4], my_eth.addr_bytes[5]);
-        return 0;
+        return args_parsed;
+}
+
+static int parse_args(int argc, char *argv[]) {
+	static struct option long_options[] = {
+		{"segs", required_argument, NULL, 's'},
+		{"copy", no_argument, NULL, 'c'}
+	};
+
+	int long_index = 0;
+	int opt = 0;
+	while ((opt = getopt_long(argc, argv, "s:c", long_options, &long_index)) != -1) {
+		switch (opt) {
+			case 's':
+				num_segs = atoi(optarg);
+				if (num_segs < 1) {
+					printf("--segs %d is invalid. Number of " 
+						"segments must be greater than 1.\n", num_segs);
+					printf("Changing number of segments to 1.\n");
+					num_segs = 1;
+				}
+				break;
+			case 'c':
+				mode = MODE_COPY;
+				break;
+		}
+	}
+
+	if (mode == MODE_NOCOPY && num_segs > 1) {
+		printf("If number of segments is more than 1, cannot perform a "
+			"no copy echo. Switching mode to MODE_COPY.\n");
+		mode = MODE_COPY;
+	}
+	return 0;
 }
 
 /*
@@ -418,12 +478,16 @@ static int init_dpdk(int argc, char *argv[])
 int
 main(int argc, char *argv[])
 {
-	init_dpdk(argc, argv);
+	int args_parsed = init_dpdk(argc, argv);
+	if (args_parsed < 0) {
+		return -1;
+	}
+	argc -= args_parsed;
+	argv += args_parsed;
 
-	if (mode == MODE_UDP_CLIENT)
-		printf("ERROR, only server mode is supported\n");
-	else
-		do_server();
+	parse_args(argc, argv);
+
+	do_server();
 
 	return 0;
 }
